@@ -1,4 +1,4 @@
-# JARONA - QuickJS Bytecode Decompiler v5.0
+# JARONA - QuickJS Bytecode Decompiler
 
 A standalone, dependency-free QuickJS bytecode decompiler written in pure C.
 Refactored from the original `frida-decompile.c` (which depended on QuickJS internals)
