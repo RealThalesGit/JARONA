@@ -209,6 +209,8 @@ This produces readable JS-like output that approximates the original source.
 | Decompilation | None | Pseudo-JS with virtual stack |
 | Code size | 877 lines | ~3500 lines (modular) |
 
+(frida-decompile.c is a old thing though...)
+
 ## License
 
 Same as the original JARONA project.
