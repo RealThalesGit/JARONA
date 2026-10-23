@@ -1,0 +1,34 @@
+# Build artifacts
+*.o
+*.d
+jarona-decompile
+extract_bytecode
+*.a
+*.so
+
+# Core dumps
+core
+core.*
+*.core
+vgcore.*
+hs_err_pid*
+
+# Test outputs
+tests/fixtures/*.dec.js
+tests/fixtures/*.err
+tests/fixtures/*.out
+tests/fixtures/*.json
+tests/modules/*.dec.js
+tests/modules/*.err
+/tmp/
+/var/tmp/
+
+# Editor
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
