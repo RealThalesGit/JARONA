@@ -161,10 +161,11 @@ static void format_value_into(char **pbuf, size_t *plen, size_t *pcap,
             if (isnan(d)) buf_append(pbuf, plen, pcap, "NaN", 3);
             else if (isinf(d)) buf_append(pbuf, plen, pcap, d < 0 ? "-Infinity" : "Infinity", d < 0 ? 9 : 8);
             else {
-                /* Use %g-like formatting but always include a decimal */
+                /* Shortest representation that reads back as the same
+                 * double (the way JavaScript prints numbers). */
                 char tmp[64];
-                int n = snprintf(tmp, sizeof(tmp), "%.17g", d);
-                buf_append(pbuf, plen, pcap, tmp, n);
+                jarona_format_double(d, tmp, sizeof(tmp));
+                buf_append(pbuf, plen, pcap, tmp, (int)strlen(tmp));
                 if (!strchr(tmp, '.') && !strchr(tmp, 'e') && !strchr(tmp, 'n') && !strchr(tmp, 'i'))
                     buf_append(pbuf, plen, pcap, ".0", 2);
             }
@@ -454,10 +455,13 @@ static void disasm_bytecode(FILE *out, qjs_reader_t *r, qjs_function_t *fn,
     }
 
     int first_insn = 1;
+    qjs_op_mode_t op_mode = fn->is_frida ? QJS_MODE_FRIDA : QJS_MODE_VANILLA;
 
     for (uint32_t pc = 0; pc < len;) {
         uint8_t op = bc[pc];
-        if (op >= QJS_OP_INFO_COUNT) {
+        const qjs_op_info_t *info = qjs_get_op_info(op, op_mode);
+
+        if (!info || info->size == 0 || !info->name) {
             if (mode == QJS_OUT_TEXT) {
                 put_indent(out, indent);
                 fprintf(out, "[0x%04X] <INVALID 0x%02X>\n", pc, op);
@@ -472,7 +476,6 @@ static void disasm_bytecode(FILE *out, qjs_reader_t *r, qjs_function_t *fn,
             continue;
         }
 
-        const qjs_op_info_t *info = &qjs_op_info[op];
         int sz = info->size;
 
         if (pc + sz > len) {

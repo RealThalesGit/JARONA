@@ -11,6 +11,18 @@
 #include <string.h>
 
 /* =========================================================
+ * Compiler helpers
+ * ========================================================= */
+/* Marks a function or variable that is intentionally kept although it is
+ * not referenced (yet).  Silences -Wunused-function / -Wunused-variable on
+ * GCC and Clang; expands to nothing on other compilers. */
+#if defined(__GNUC__) || defined(__clang__)
+#  define JARONA_UNUSED __attribute__((unused))
+#else
+#  define JARONA_UNUSED
+#endif
+
+/* =========================================================
  * Memory helpers
  * ========================================================= */
 static inline void *xmalloc(size_t sz) {
@@ -57,6 +69,15 @@ static inline uint32_t rd_u32(const uint8_t *p, int big_endian) {
 static inline int32_t rd_i32(const uint8_t *p, int big_endian) {
     return (int32_t)rd_u32(p, big_endian);
 }
+static inline void wr_u32(uint8_t *p, uint32_t v, int big_endian) {
+    if (big_endian) {
+        p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16);
+        p[2] = (uint8_t)(v >> 8);  p[3] = (uint8_t)v;
+    } else {
+        p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
+        p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+    }
+}
 static inline uint64_t rd_u64(const uint8_t *p, int big_endian) {
     uint64_t v = 0;
     if (big_endian) {
@@ -89,23 +110,14 @@ static inline int get_leb128_u32(uint32_t *pval, const uint8_t *p, const uint8_t
 }
 
 static inline int get_sleb128_i32(int32_t *pval, const uint8_t *p, const uint8_t *end) {
-    int32_t v = 0;
-    int shift = 0, n = 0;
-    uint8_t b = 0;
-    while (p < end) {
-        b = *p++;
-        n++;
-        v |= (int32_t)(b & 0x7f) << shift;
-        shift += 7;
-        if (!(b & 0x80)) {
-            if (shift < 32 && (b & 0x40))
-                v |= -((int32_t)1 << shift);
-            *pval = v;
-            return n;
-        }
-        if (shift >= 32) return -1;
-    }
-    return -1;
+    /* QuickJS does not use standard signed LEB128 here: it stores a
+     * zig-zag encoded unsigned value (see dbuf_put_sleb128/get_sleb128
+     * in quickjs.c). */
+    uint32_t u;
+    int n = get_leb128_u32(&u, p, end);
+    if (n < 0) { *pval = 0; return -1; }
+    *pval = (int32_t)((u >> 1) ^ (uint32_t)-(int32_t)(u & 1));
+    return n;
 }
 
 /* =========================================================
@@ -113,6 +125,15 @@ static inline int get_sleb128_i32(int32_t *pval, const uint8_t *p, const uint8_t
  * ========================================================= */
 /* Returns a malloc'd string with C-style escapes. */
 char *jarona_escape_str(const char *s, size_t len, int for_json);
+
+/* =========================================================
+ * Number formatting
+ * ========================================================= */
+/* Format a double the way JavaScript's Number::toString() does: the
+ * shortest decimal representation that reads back as the very same double.
+ * The result is written to `out` (which must hold at least 32 bytes).
+ * Non finite values are rendered as "NaN", "Infinity" and "-Infinity". */
+void jarona_format_double(double d, char *out, size_t outlen);
 
 /* =========================================================
  * Indentation helper

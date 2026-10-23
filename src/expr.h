@@ -33,7 +33,7 @@
  * Get precedence for a binary operator string
  * ========================================================= */
 static inline int op_prec(const char *op) {
-    if (!strcmp(op, "||")) return PREC_OR;
+    if (!strcmp(op, "||") || !strcmp(op, "??")) return PREC_OR;
     if (!strcmp(op, "&&")) return PREC_AND;
     if (!strcmp(op, "|")) return PREC_BOR;
     if (!strcmp(op, "^")) return PREC_BXOR;

@@ -6,7 +6,7 @@
  */
 #include "ir.h"
 #include "util.h"
-#include "qjs_opcodes_frida.h"
+#include "qjs_opcodes.h"
 #include <string.h>
 
 /* =========================================================
@@ -29,7 +29,8 @@ ir_function_t *ir_build(qjs_reader_t *r, qjs_function_t *fn) {
     uint32_t pc = 0;
     while (pc < len) {
         uint8_t op = bc[pc];
-        const qjs_op_info_t *info = get_op_info(op, fn->is_frida);
+        const qjs_op_info_t *info = qjs_get_op_info(op,
+            fn->is_frida ? QJS_MODE_FRIDA : QJS_MODE_VANILLA);
         if (!info) {
             /* invalid opcode - record and skip */
             ir->insns[ir->count].pc = pc;

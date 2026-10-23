@@ -1,5 +1,5 @@
 /*
- * main.c - JARONA QuickJS bytecode decompiler (refactored)
+ * main.c - JARONA QuickJS bytecode decompiler
  *
  * Standalone tool that parses QuickJS bytecode binary format directly
  * (no QuickJS runtime dependency) and produces:
@@ -9,19 +9,6 @@
  *
  * Usage:
  *   jarona-decompile [options] <bytecode_file>
- *
- * Options:
- *   -c                Treat input as compiled binary (search for QBCF magic)
- *   --json            Output JSON instead of text
- *   --decompile       Output pseudo-JS decompilation
- *   --stats           Print statistics to stderr
- *   --atoms           Print atom table
- *   -o <file>         Write output to file
- *   -h, --help        Show help
- *
- * Build:
- *   make
- *   (or see Makefile)
  */
 #include "qjs_format.h"
 #include "qjs_opcodes.h"
@@ -38,7 +25,7 @@
 #include <getopt.h>
 
 #define PROGRAM_NAME "jarona-decompile"
-#define PROGRAM_VERSION "5.0"
+#define PROGRAM_VERSION "6.0"
 
 /* =========================================================
  * Help text
@@ -54,6 +41,9 @@ static void print_help(void) {
         "  -d, --decompile       Output pseudo-JS decompilation\n"
         "  -s, --stats           Print statistics to stderr\n"
         "  -a, --atoms           Print atom table to stderr\n"
+        "  -x, --hex             Print a hex dump of the bytecode payload\n"
+        "      --vanilla         Force the vanilla QuickJS built-in atom table\n"
+        "      --frida           Force Frida's QuickJS built-in atom table\n"
         "  -o, --output <file>   Write output to file (default: stdout)\n"
         "  -h, --help            Show this help\n"
         "\n"
@@ -62,6 +52,7 @@ static void print_help(void) {
         "  - QBCF-embedded bytecode (compiled binaries)\n"
         "  - Big-endian vs little-endian\n"
         "  - Bytecode version (v1 or v2 / Bignum)\n"
+        "  - Vanilla vs Frida built-in atom table\n"
         "\n"
         "Examples:\n"
         "  " PROGRAM_NAME " test.qjsc                 # disassemble raw bytecode\n"
@@ -177,10 +168,35 @@ static uint8_t *extract_qbcf(uint8_t *buf, size_t size, size_t *out_payload_size
 }
 
 /* =========================================================
+ * Print a hex dump of the bytecode payload
+ * ========================================================= */
+static void print_hex_dump(FILE *out, const uint8_t *buf, size_t len) {
+    fprintf(out, "; ===== Hex dump (%zu bytes) =====\n", len);
+    for (size_t i = 0; i < len; i += 16) {
+        fprintf(out, "%08zx  ", i);
+        for (size_t j = 0; j < 16; j++) {
+            if (i + j < len)
+                fprintf(out, "%02x ", buf[i + j]);
+            else
+                fputs("   ", out);
+            if (j == 7) fputc(' ', out);
+        }
+        fprintf(out, " |");
+        for (size_t j = 0; j < 16 && i + j < len; j++) {
+            uint8_t c = buf[i + j];
+            fputc((c >= 0x20 && c < 0x7f) ? c : '.', out);
+        }
+        fprintf(out, "|\n");
+    }
+}
+
+/* =========================================================
  * Print atom table (to stderr for --atoms)
  * ========================================================= */
 static void print_atoms(FILE *out, qjs_reader_t *r) {
-    fprintf(out, "; ===== Atom Table (%u atoms) =====\n", r->atoms.count);
+    fprintf(out, "; ===== Atom Table (%u atoms, first_atom=%u, flavour=%s) =====\n",
+            r->atoms.count, r->atoms.first_atom,
+            r->atoms.flavor == QJS_ATOM_FLAVOR_FRIDA ? "frida" : "vanilla");
     for (uint32_t i = 0; i < r->atoms.count; i++) {
         fprintf(out, ";   [%u] ", r->atoms.first_atom + i);
         if (r->atoms.atom_wide[i]) fprintf(out, "(wide) ");
@@ -202,18 +218,55 @@ static void print_atoms(FILE *out, qjs_reader_t *r) {
 }
 
 /* =========================================================
+ * Count functions / instructions recursively (for --stats)
+ * ========================================================= */
+typedef struct {
+    int functions;
+    int instructions;
+    int total_bytes;
+    int cpool_entries;
+    int atoms_used;
+} qjs_stats_t;
+
+static void collect_stats(qjs_function_t *fn, qjs_stats_t *st) {
+    if (!fn) return;
+    st->functions++;
+    st->total_bytes += fn->byte_code_len;
+    st->cpool_entries += fn->cpool_count;
+    for (int i = 0; i < fn->cpool_count; i++) {
+        qjs_value_t *v = fn->cpool[i];
+        if (!v) continue;
+        if (v->kind == QJS_VAL_FUNCTION)
+            collect_stats(v->u.func.fn, st);
+    }
+}
+
+/* =========================================================
  * Print statistics
  * ========================================================= */
-static void print_stats(FILE *out, qjs_reader_t *r, qjs_value_t *v) {
+static void print_stats(FILE *out, qjs_reader_t *r, qjs_value_t **values, int count) {
+    qjs_stats_t st = {0, 0, 0, 0, 0};
+
+    for (int i = 0; i < count; i++) {
+        qjs_value_t *v = values[i];
+        if (!v) continue;
+        if (v->kind == QJS_VAL_FUNCTION)
+            collect_stats(v->u.func.fn, &st);
+        else if (v->kind == QJS_VAL_MODULE && v->u.mod.mod->func)
+            collect_stats(v->u.mod.mod->func, &st);
+    }
+
     fprintf(out, "; ===== Statistics =====\n");
     fprintf(out, ";   atoms:        %u\n", r->atoms.count);
+    fprintf(out, ";   first_atom:   %u\n", r->atoms.first_atom);
+    fprintf(out, ";   atom flavour: %s\n",
+            r->atoms.flavor == QJS_ATOM_FLAVOR_FRIDA ? "frida" : "vanilla");
     fprintf(out, ";   obj_refs:     %d\n", r->obj_refs_count);
     fprintf(out, ";   big_endian:   %s\n", r->big_endian ? "yes" : "no");
-    fprintf(out, ";   functions:    %d\n", r->func_count);
-
-    /* count total bytecode bytes and instructions */
-    /* (would need a recursive walker; omitted for brevity) */
-    (void)v;
+    fprintf(out, ";   modules:      %d\n", count);
+    fprintf(out, ";   functions:    %d\n", st.functions);
+    fprintf(out, ";   cpool:        %d\n", st.cpool_entries);
+    fprintf(out, ";   bytecode:     %d bytes\n", st.total_bytes);
 }
 
 /* =========================================================
@@ -225,6 +278,8 @@ int main(int argc, char **argv) {
     int want_decompile = 0;
     int want_stats = 0;
     int want_atoms = 0;
+    int want_hex = 0;
+    int force_flavor = -1;   /* -1 auto, 0 vanilla, 1 frida */
     const char *output_path = NULL;
 
     static struct option long_opts[] = {
@@ -233,21 +288,27 @@ int main(int argc, char **argv) {
         { "decompile",  no_argument,       0, 'd' },
         { "stats",      no_argument,       0, 's' },
         { "atoms",      no_argument,       0, 'a' },
+        { "hex",        no_argument,       0, 'x' },
+        { "vanilla",    no_argument,       0, 1000 },
+        { "frida",      no_argument,       0, 1001 },
         { "output",     required_argument, 0, 'o' },
         { "help",       no_argument,       0, 'h' },
         { 0, 0, 0, 0 }
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "cjdso:ah", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "cjdso:axh", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'c': compiled_mode = 1; break;
             case 'j': want_json = 1; break;
             case 'd': want_decompile = 1; break;
             case 's': want_stats = 1; break;
             case 'a': want_atoms = 1; break;
+            case 'x': want_hex = 1; break;
             case 'o': output_path = optarg; break;
             case 'h': print_help(); return 0;
+            case 1000: force_flavor = QJS_ATOM_FLAVOR_VANILLA; break;
+            case 1001: force_flavor = QJS_ATOM_FLAVOR_FRIDA; break;
             default:  print_help(); return 1;
         }
     }
@@ -287,12 +348,31 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Parse the bytecode */
-    qjs_value_t *v = qjs_parse_bytecode(bc, bc_len, 1, 1);
-    if (!v) {
+    /* Parse the bytecode.  The reader keeps the atom table around so atoms
+     * can be resolved while printing.  A file may hold several modules
+     * (one blob each); all of them are parsed. */
+    qjs_reader_t rs;
+    qjs_value_t **values = NULL;
+    int value_count = 0;
+    if (qjs_parse_bytecode_list(&rs, bc, bc_len, 1, 1, &values, &value_count) < 0) {
         fprintf(stderr, "error: failed to parse bytecode\n");
+        qjs_reader_cleanup(&rs);
         free(file_buf);
         return 1;
+    }
+
+    /* An explicitly requested flavour overrides the auto-detection. */
+    if (force_flavor >= 0 && force_flavor != rs.atoms.flavor) {
+        int saved_flavor = rs.atoms.flavor;
+        uint32_t saved_first = rs.atoms.first_atom;
+        rs.atoms.flavor = force_flavor;
+        rs.atoms.first_atom = (force_flavor == QJS_ATOM_FLAVOR_FRIDA)
+                            ? QJS_FRIDA_ATOM_END : QJS_VANILLA_ATOM_END;
+        (void)saved_flavor;
+        (void)saved_first;
+        fprintf(stderr, "info: forced %s atom table (first_atom=%u)\n",
+                force_flavor == QJS_ATOM_FLAVOR_FRIDA ? "frida" : "vanilla",
+                rs.atoms.first_atom);
     }
 
     /* Set up output */
@@ -301,7 +381,9 @@ int main(int argc, char **argv) {
         out = fopen(output_path, "w");
         if (!out) {
             perror("fopen");
-            qjs_value_free(v);
+            for (int i = 0; i < value_count; i++) qjs_value_free(values[i]);
+            free(values);
+            qjs_reader_cleanup(&rs);
             free(file_buf);
             return 1;
         }
@@ -313,71 +395,6 @@ int main(int argc, char **argv) {
 
     /* Reset the global cpool counter */
     qjs_disasm_reset();
-
-    /* Build a reader for atom resolution (re-init from the parsed state) */
-    /* We need to reconstruct the reader with the atom table - parse_bytecode
-     * created one internally. To keep things simple, we re-parse for the
-     * atom table only: */
-    qjs_reader_t rs;
-    qjs_reader_init(&rs, bc, bc_len);
-    /* Match parse_bytecode's first_atom setting (allow_bytecode=1) */
-    rs.atoms.first_atom = QJS_BUILTIN_ATOM_COUNT;
-    /* re-run the atom table parse to populate rs.atoms */
-    {
-        uint8_t version;
-        if (qjs_get_u8(&rs, &version) == 0) {
-            int ver = version & 0x3f;
-            int be = (version & 0x40) ? 1 : 0;
-            (void)ver;
-            rs.big_endian = be;
-            uint32_t atom_count;
-            if (qjs_get_leb128(&rs, &atom_count) == 0) {
-                rs.atoms.count = atom_count;
-                if (atom_count > 0) {
-                    rs.atoms.atoms = xcalloc(atom_count, sizeof(char *));
-                    rs.atoms.atom_lens = xcalloc(atom_count, sizeof(uint32_t));
-                    rs.atoms.atom_wide = xcalloc(atom_count, sizeof(uint8_t));
-                    for (uint32_t i = 0; i < atom_count; i++) {
-                        uint32_t len;
-                        if (qjs_get_leb128(&rs, &len) < 0) break;
-                        int is_wide = len & 1;
-                        len >>= 1;
-                        if (!is_wide) {
-                            char *s = xmalloc(len + 1);
-                            if (qjs_get_buf(&rs, (uint8_t *)s, len) < 0) { free(s); break; }
-                            s[len] = '\0';
-                            rs.atoms.atoms[i] = s;
-                            rs.atoms.atom_lens[i] = len;
-                        } else {
-                            size_t bytes = (size_t)len * 2;
-                            uint8_t *buf2 = xmalloc(bytes);
-                            if (qjs_get_buf(&rs, buf2, bytes) < 0) { free(buf2); break; }
-                            size_t out_cap = (size_t)len * 3 + 1;
-                            char *out_s = xmalloc(out_cap);
-                            size_t oi = 0;
-                            for (uint32_t j = 0; j < len; j++) {
-                                uint16_t cp = rd_u16(buf2 + j * 2, be);
-                                if (cp < 0x80) out_s[oi++] = (char)cp;
-                                else if (cp < 0x800) {
-                                    out_s[oi++] = (char)(0xc0 | (cp >> 6));
-                                    out_s[oi++] = (char)(0x80 | (cp & 0x3f));
-                                } else {
-                                    out_s[oi++] = (char)(0xe0 | (cp >> 12));
-                                    out_s[oi++] = (char)(0x80 | ((cp >> 6) & 0x3f));
-                                    out_s[oi++] = (char)(0x80 | (cp & 0x3f));
-                                }
-                            }
-                            out_s[oi] = '\0';
-                            free(buf2);
-                            rs.atoms.atoms[i] = out_s;
-                            rs.atoms.atom_lens[i] = (uint32_t)oi;
-                            rs.atoms.atom_wide[i] = 1;
-                        }
-                    }
-                }
-            }
-        }
-    }
 
     /* Print header (only for disassembly mode, not decompile mode) */
     if (mode == QJS_OUT_TEXT && !want_decompile) {
@@ -393,6 +410,9 @@ int main(int argc, char **argv) {
         fprintf(out, "  \"bytecode_size\": %zu,\n", bc_len);
         fprintf(out, "  \"big_endian\": %s,\n", rs.big_endian ? "true" : "false");
         fprintf(out, "  \"atom_count\": %u,\n", rs.atoms.count);
+        fprintf(out, "  \"first_atom\": %u,\n", rs.atoms.first_atom);
+        fprintf(out, "  \"atom_flavour\": \"%s\",\n",
+                rs.atoms.flavor == QJS_ATOM_FLAVOR_FRIDA ? "frida" : "vanilla");
         fprintf(out, "  \"functions\": [\n");
     }
 
@@ -401,11 +421,18 @@ int main(int argc, char **argv) {
         print_atoms(stderr, &rs);
     }
 
+    /* Hex dump if requested */
+    if (want_hex) {
+        print_hex_dump(out, bc, bc_len);
+    }
+
     /* Main output */
     if (want_decompile) {
-        qjs_decompile_value(out, &rs, v, 1);
+        for (int i = 0; i < value_count; i++)
+            qjs_decompile_value(out, &rs, values[i], 0);
     } else {
-        qjs_disasm_value(out, &rs, v, mode, 1);
+        for (int i = 0; i < value_count; i++)
+            qjs_disasm_value(out, &rs, values[i], mode, 1);
     }
 
     /* JSON closing */
@@ -415,21 +442,14 @@ int main(int argc, char **argv) {
 
     /* Stats */
     if (want_stats) {
-        print_stats(stderr, &rs, v);
+        print_stats(stderr, &rs, values, value_count);
     }
 
     /* Cleanup */
     if (out != stdout) fclose(out);
-    qjs_value_free(v);
-    /* Free atom table in rs */
-    if (rs.atoms.atoms) {
-        for (uint32_t i = 0; i < rs.atoms.count; i++)
-            free(rs.atoms.atoms[i]);
-        free(rs.atoms.atoms);
-        free(rs.atoms.atom_lens);
-        free(rs.atoms.atom_wide);
-    }
-    free(rs.obj_refs);
+    for (int i = 0; i < value_count; i++) qjs_value_free(values[i]);
+    free(values);
+    qjs_reader_cleanup(&rs);
     free(file_buf);
 
     return 0;

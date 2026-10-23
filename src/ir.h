@@ -41,6 +41,7 @@ typedef enum {
     IR_STMT_ASSIGN,      /* lvalue = expr */
     IR_STMT_COMPOUND_ASSIGN, /* lvalue += expr */
     IR_STMT_DECL,        /* let/const/var name = expr (or just let name) */
+    IR_STMT_DESTRUCTURE,  /* const {a, b} = expr; / const [a, b] = expr; */
     IR_STMT_RETURN,      /* return expr; or return; */
     IR_STMT_THROW,       /* throw expr; */
     IR_STMT_IF,          /* if (cond) { then } else { else } */
@@ -50,7 +51,12 @@ typedef enum {
     IR_STMT_BREAK,       /* break; */
     IR_STMT_CONTINUE,    /* continue; */
     IR_STMT_BLOCK,       /* { ... } */
+    IR_STMT_SWITCH,      /* switch (cond) { case ...: ... } (children are CASE) */
+    IR_STMT_CASE,        /* one case of a switch: "case expr:" / "default:" */
     IR_STMT_TRY,         /* try { } catch(e) { } finally { } */
+    IR_STMT_CLASS,       /* class Name extends Base { members } */
+    IR_STMT_CLASS_MEMBER,/* one method / getter / setter of a class */
+    IR_STMT_FUNC_DECL,   /* function name(args) { ... } (module level) */
     IR_STMT_LABEL,       /* Lxxxx: (for unresolved gotos) */
     IR_STMT_GOTO,        /* goto Lxxxx; (for unresolved jumps) */
     IR_STMT_EMPTY,       /* ; (empty, will be elided) */
@@ -65,15 +71,16 @@ struct ir_stmt {
     ir_stmt_kind_t kind;
 
     /* expression fields */
-    char *expr;          /* for EXPR, RETURN, THROW */
+    char *expr;          /* for EXPR, RETURN, THROW, CASE (case value) */
     char *lvalue;        /* for ASSIGN, COMPOUND_ASSIGN, DECL */
     char *rhs;           /* for ASSIGN, COMPOUND_ASSIGN, DECL */
     char *op;            /* for COMPOUND_ASSIGN: "+=", "-=" etc */
     int   decl_kind;     /* for DECL: 0=var, 1=let, 2=const */
+    char *export_name;   /* for DECL/DESTRUCTURE/FUNC_DECL: exported name */
 
     /* control flow fields */
-    char *cond;          /* for IF, WHILE, DO_WHILE, FOR */
-    ir_stmt_t *body;     /* for IF(then), WHILE, DO_WHILE, FOR, TRY */
+    char *cond;          /* for IF, WHILE, DO_WHILE, FOR, SWITCH */
+    ir_stmt_t *body;     /* for IF(then), WHILE, DO_WHILE, FOR, TRY, CASE */
     ir_stmt_t *else_body;/* for IF */
     ir_stmt_t *init;     /* for FOR */
     ir_stmt_t *update;   /* for FOR */
@@ -81,11 +88,16 @@ struct ir_stmt {
     char *catch_var;     /* for TRY */
     ir_stmt_t *finally_body; /* for TRY */
 
+    /* class support */
+    char *class_name;      /* for CLASS: the class name */
+    char *class_heritage;  /* for CLASS: the 'extends' expression (or NULL) */
+    int   is_static;       /* for CLASS_MEMBER: static member */
+
     /* label */
     char *label;         /* for LABEL, GOTO */
 
     /* block */
-    ir_stmt_t **children; /* for BLOCK */
+    ir_stmt_t **children; /* for BLOCK, SWITCH (CASE nodes), CLASS */
     int n_children;
 
     /* source PC range (for debugging) */
@@ -116,9 +128,11 @@ void ir_free(ir_function_t *ir);
  * Statement-based decompiler
  *
  * Takes an ir_function_t and produces a list of statements
- * with reconstructed control flow.
+ * with reconstructed control flow.  `module` is non-NULL when the
+ * function is the body of an ES module.
  * ========================================================= */
-ir_stmt_t *ir_decompile_function(qjs_reader_t *r, qjs_function_t *fn, int cpool_base);
+ir_stmt_t *ir_decompile_function(qjs_reader_t *r, qjs_function_t *fn, int cpool_base,
+                                 qjs_module_t *module);
 
 /* Free a statement tree */
 void ir_stmt_free(ir_stmt_t *s);

@@ -13,7 +13,32 @@ void qjs_reader_init(qjs_reader_t *r, const uint8_t *buf, size_t len) {
     r->big_endian = 0;
     r->atoms.atoms = NULL;
     r->atoms.count = 0;
-    r->atoms.first_atom = 1; /* JS_ATOM_END */
+    r->atoms.arena_cap = 0;
+    r->atoms.first_atom = 1; /* JS_ATOM_NULL */
+    r->atoms.flavor = QJS_ATOM_FLAVOR_VANILLA;
+    r->atoms.max_user_ref = 0;
+    r->atoms.saw_user_ref = 0;
+    r->blob_atom_count = 0;
+    r->blob_atom_base = 0;
+    r->obj_refs = NULL;
+    r->obj_refs_count = 0;
+    r->obj_refs_cap = 0;
+}
+
+void qjs_reader_cleanup(qjs_reader_t *r) {
+    if (!r) return;
+    if (r->atoms.atoms) {
+        for (uint32_t i = 0; i < r->atoms.count; i++)
+            free(r->atoms.atoms[i]);
+        free(r->atoms.atoms);
+        r->atoms.atoms = NULL;
+    }
+    free(r->atoms.atom_lens);
+    free(r->atoms.atom_wide);
+    r->atoms.atom_lens = NULL;
+    r->atoms.atom_wide = NULL;
+    r->atoms.count = 0;
+    free(r->obj_refs);
     r->obj_refs = NULL;
     r->obj_refs_count = 0;
     r->obj_refs_cap = 0;
@@ -156,6 +181,39 @@ int qjs_get_atom(qjs_reader_t *r, uint32_t *atom_idx) {
         return 0;
     }
     /* regular atom: store the index (= v >> 1), no high bit set */
-    *atom_idx = v >> 1;
+    uint32_t idx = v >> 1;
+
+    /* Validate against the atom table layout.
+     *
+     * QuickJS serialises user atoms with *contiguous* indices starting at
+     * JS_ATOM_END (bc_atom_to_idx()): the n-th distinct user atom gets the
+     * index first_atom + n.  Built-in atoms keep their raw index and are
+     * never listed in the file's atom table.
+     *
+     * Therefore an index >= first_atom must satisfy
+     *     index - first_atom < atoms.count
+     * and the largest such index must be exactly first_atom + count - 1
+     * (every atom in the table was referenced at least once).
+     *
+     * Violating that means our idea of first_atom is wrong, which is how
+     * the vanilla / Frida flavour is auto-detected. */
+    uint32_t first = r->atoms.first_atom;
+    if (idx >= first) {
+        uint32_t rel = idx - first;
+        if (rel >= r->blob_atom_count) {
+            qjs_reader_set_error(r, "atom index out of range");
+            *atom_idx = 0;
+            return -1;
+        }
+        if (!r->atoms.saw_user_ref || rel > r->atoms.max_user_ref) {
+            r->atoms.max_user_ref = rel;
+        }
+        r->atoms.saw_user_ref = 1;
+        /* Translate the blob-local index into an arena index so that atoms
+         * of different blobs can live side by side in one table. */
+        idx = first + r->blob_atom_base + rel;
+    }
+
+    *atom_idx = idx;
     return 0;
 }

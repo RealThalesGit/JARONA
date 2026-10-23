@@ -10,11 +10,15 @@
 
 #include "qjs_format.h"
 #include "util.h"
+#include "qjs_builtin_atoms.h"
 
 /* =========================================================
  * Initialize a reader over a buffer
  * ========================================================= */
 void qjs_reader_init(qjs_reader_t *r, const uint8_t *buf, size_t len);
+
+/* Release everything the reader owns (atom table, object refs). */
+void qjs_reader_cleanup(qjs_reader_t *r);
 
 /* =========================================================
  * Set/get error state

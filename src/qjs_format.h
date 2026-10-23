@@ -155,6 +155,7 @@ struct qjs_value_s {
         struct {
             qjs_value_t **items;
             uint32_t count;
+            qjs_value_t *raw;      /* template objects: raw strings array */
         } arr;
         struct {
             char *digits;          /* raw digit string for display */
@@ -246,6 +247,13 @@ typedef struct {
     uint32_t export_name_atom;
 } qjs_export_star_entry_t;
 
+/* An import entry: "import { a as b } from "mod";" */
+typedef struct {
+    int      var_idx;             /* closure var index in the module function */
+    uint32_t import_name_atom;    /* imported name ("default", "*" or a name) */
+    int      req_module_idx;      /* index into req_modules */
+} qjs_import_entry_t;
+
 struct qjs_module_s {
     uint32_t module_name_atom;
     qjs_req_module_entry_t *req_modules;
@@ -256,18 +264,30 @@ struct qjs_module_s {
     int star_export_count;
     qjs_export_star_entry_t *export_star;
     int export_star_count;
+    qjs_import_entry_t *imports;
+    int import_count;
     qjs_function_t *func;          /* the module body */
 };
 
 /* =========================================================
  * Atom table (global, top-level)
+ *
+ * A byte code file may contain several independent "blobs" (a blob is
+ * one "version byte + atom table + object" sequence, as produced by
+ * JS_WriteObject()).  Every blob carries its own atom table, so the
+ * user atoms of all blobs live in a single arena here; a blob's atom
+ * index is translated to an arena index while the blob is parsed.
  * ========================================================= */
 typedef struct {
-    char    **atoms;
+    char    **atoms;               /* arena: user atom strings of every blob */
     uint32_t *atom_lens;
     uint8_t  *atom_wide;
-    uint32_t  count;
-    uint32_t  first_atom;          /* JS_ATOM_END = 1 normally */
+    uint32_t  count;               /* number of entries in the arena */
+    uint32_t  arena_cap;           /* allocated slots in the arena */
+    uint32_t  first_atom;          /* JS_ATOM_END of the producing runtime */
+    int       flavor;              /* qjs_atom_flavor_t: vanilla | frida */
+    uint32_t  max_user_ref;        /* highest (idx - first_atom) seen */
+    int       saw_user_ref;        /* 1 if at least one user atom was seen */
 } qjs_atom_table_t;
 
 /* =========================================================
@@ -284,6 +304,12 @@ typedef struct {
 
     /* atom table (parsed once at top level) */
     qjs_atom_table_t atoms;
+
+    /* Atom bookkeeping for the blob that is currently being parsed.
+     * `blob_atom_count` is the number of atoms listed by the current
+     * blob, `blob_atom_base` is the arena offset of its first atom. */
+    uint32_t          blob_atom_count;
+    uint32_t          blob_atom_base;
 
     /* object references (for BC_TAG_OBJECT_REFERENCE) */
     qjs_value_t **obj_refs;

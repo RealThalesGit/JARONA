@@ -3,13 +3,35 @@
  */
 #include "value.h"
 #include "qjs_opcodes.h"
-#include "qjs_opcodes_frida.h"
 #include "qjs_builtin_atoms.h"
 #include <stdio.h>
+#include <inttypes.h>
 
 /* =========================================================
- * Atom table parsing (called once at the top level)
+ * Atom table parsing (called once per blob)
  * ========================================================= */
+
+/* Make room for `extra` more user atoms in the shared arena. */
+static int atom_arena_reserve(qjs_reader_t *r, uint32_t extra) {
+    uint32_t need = r->atoms.count + extra;
+    if (need <= r->atoms.arena_cap) return 0;
+
+    uint32_t cap = r->atoms.arena_cap ? r->atoms.arena_cap * 2 : 16;
+    while (cap < need) {
+        if (cap > QJS_MAX_ATOMS / 2) { cap = need; break; }
+        cap *= 2;
+    }
+    if (cap > QJS_MAX_ATOMS) {
+        qjs_reader_set_error(r, "too many atoms");
+        return -1;
+    }
+    r->atoms.atoms     = xrealloc(r->atoms.atoms, (size_t)cap * sizeof(char *));
+    r->atoms.atom_lens = xrealloc(r->atoms.atom_lens, (size_t)cap * sizeof(uint32_t));
+    r->atoms.atom_wide = xrealloc(r->atoms.atom_wide, (size_t)cap * sizeof(uint8_t));
+    r->atoms.arena_cap = cap;
+    return 0;
+}
+
 static int parse_atom_table(qjs_reader_t *r) {
     uint8_t version;
     if (qjs_get_u8(r, &version) < 0) return -1;
@@ -24,24 +46,24 @@ static int parse_atom_table(qjs_reader_t *r) {
     }
     r->big_endian = be;
 
-    if (qjs_get_leb128(r, &r->atoms.count) < 0) return -1;
-    if (r->atoms.count > QJS_MAX_ATOMS) {
+    uint32_t count;
+    if (qjs_get_leb128(r, &count) < 0) return -1;
+    if (count > QJS_MAX_ATOMS) {
         qjs_reader_set_error(r, "too many atoms");
         return -1;
     }
 
-    if (r->atoms.count == 0) {
-        r->atoms.atoms = NULL;
-        r->atoms.atom_lens = NULL;
-        r->atoms.atom_wide = NULL;
-        return 0;
-    }
+    /* The atoms of this blob are appended to the shared arena. */
+    r->blob_atom_base  = r->atoms.count;
+    r->blob_atom_count = count;
+    r->atoms.saw_user_ref = 0;
+    r->atoms.max_user_ref = 0;
 
-    r->atoms.atoms = xcalloc(r->atoms.count, sizeof(char *));
-    r->atoms.atom_lens = xcalloc(r->atoms.count, sizeof(uint32_t));
-    r->atoms.atom_wide = xcalloc(r->atoms.count, sizeof(uint8_t));
+    if (count == 0) return 0;
 
-    for (uint32_t i = 0; i < r->atoms.count; i++) {
+    if (atom_arena_reserve(r, count) < 0) return -1;
+
+    for (uint32_t i = 0; i < count; i++) {
         uint32_t len;
         if (qjs_get_leb128(r, &len) < 0) return -1;
         int is_wide = len & 1;
@@ -52,14 +74,16 @@ static int parse_atom_table(qjs_reader_t *r) {
             return -1;
         }
 
+        uint32_t slot = r->blob_atom_base + i;
+
         /* always store as UTF-8; if wide, we convert (best-effort) */
         if (!is_wide) {
             char *s = xmalloc(len + 1);
             if (qjs_get_buf(r, (uint8_t *)s, len) < 0) { free(s); return -1; }
             s[len] = '\0';
-            r->atoms.atoms[i] = s;
-            r->atoms.atom_lens[i] = len;
-            r->atoms.atom_wide[i] = 0;
+            r->atoms.atoms[slot] = s;
+            r->atoms.atom_lens[slot] = len;
+            r->atoms.atom_wide[slot] = 0;
         } else {
             /* wide-char (UTF-16/UCS-2) string: convert to UTF-8 */
             size_t bytes = (size_t)len * 2;
@@ -84,10 +108,11 @@ static int parse_atom_table(qjs_reader_t *r) {
             }
             out[oi] = '\0';
             free(buf);
-            r->atoms.atoms[i] = out;
-            r->atoms.atom_lens[i] = (uint32_t)oi;
-            r->atoms.atom_wide[i] = 1;
+            r->atoms.atoms[slot] = out;
+            r->atoms.atom_lens[slot] = (uint32_t)oi;
+            r->atoms.atom_wide[slot] = 1;
         }
+        r->atoms.count = slot + 1;
     }
     return 0;
 }
@@ -98,9 +123,27 @@ static int parse_atom_table(qjs_reader_t *r) {
  * The stored atom_idx uses bit 31 (JS_ATOM_TAG_INT) as the tag:
  *   - If bit 31 is set: tagged-int atom. Integer value = atom_idx & 0x7FFFFFFF.
  *   - Else: regular atom index.
- *     - If idx < first_atom: built-in atom (look up in qjs_builtin_atoms).
+ *     - If idx < first_atom: built-in atom (look up in the flavour's table).
  *     - Else: idx -= first_atom, look up in user atom table.
  * ========================================================= */
+
+/* Resolve a built-in atom index for the given flavour. */
+static const char *builtin_atom_str(int flavor, uint32_t idx) {
+    const char *const *table;
+    uint32_t limit;
+
+    if (flavor == QJS_ATOM_FLAVOR_FRIDA) {
+        table = qjs_atoms_frida;
+        limit = QJS_FRIDA_ATOM_END;
+    } else {
+        table = qjs_atoms_vanilla;
+        limit = QJS_VANILLA_ATOM_END;
+    }
+    if (idx < limit && table[idx])
+        return table[idx];
+    return NULL;
+}
+
 const char *qjs_atom_str(qjs_reader_t *r, uint32_t atom_idx) {
     static char buf[64];
 
@@ -114,9 +157,8 @@ const char *qjs_atom_str(qjs_reader_t *r, uint32_t atom_idx) {
     uint32_t first = r->atoms.first_atom;
     if (idx < first) {
         /* built-in atom */
-        if (idx < QJS_BUILTIN_ATOM_COUNT && qjs_builtin_atoms[idx]) {
-            return qjs_builtin_atoms[idx];
-        }
+        const char *s = builtin_atom_str(r->atoms.flavor, idx);
+        if (s) return s;
         snprintf(buf, sizeof(buf), "_builtin_%u", idx);
         return buf;
     }
@@ -134,6 +176,48 @@ const char *qjs_atom_str(qjs_reader_t *r, uint32_t atom_idx) {
 
 char *qjs_atom_dup(qjs_reader_t *r, uint32_t atom_idx) {
     return xstrdup(qjs_atom_str(r, atom_idx));
+}
+
+/* Like qjs_atom_str(), but also reports the exact byte length of the atom.
+ * QuickJS strings may contain NUL bytes, so a strlen() based copy would
+ * truncate them. */
+const char *qjs_atom_str_len(qjs_reader_t *r, uint32_t atom_idx, uint32_t *len) {
+    static char buf[64];
+
+    if (len) *len = 0;
+
+    if (atom_idx & 0x80000000u) {
+        snprintf(buf, sizeof(buf), "%u", atom_idx & 0x7FFFFFFFu);
+        if (len) *len = (uint32_t)strlen(buf);
+        return buf;
+    }
+
+    uint32_t idx = atom_idx;
+    uint32_t first = r->atoms.first_atom;
+    if (idx < first) {
+        const char *s = builtin_atom_str(r->atoms.flavor, idx);
+        if (s) {
+            if (len) *len = (uint32_t)strlen(s);
+            return s;
+        }
+        snprintf(buf, sizeof(buf), "_builtin_%u", idx);
+        if (len) *len = (uint32_t)strlen(buf);
+        return buf;
+    }
+    idx -= first;
+    if (idx >= r->atoms.count) {
+        snprintf(buf, sizeof(buf), "_atom_oob_%u", atom_idx);
+        if (len) *len = (uint32_t)strlen(buf);
+        return buf;
+    }
+    if (!r->atoms.atoms || !r->atoms.atoms[idx]) {
+        snprintf(buf, sizeof(buf), "_atom_null_%u", atom_idx);
+        if (len) *len = (uint32_t)strlen(buf);
+        return buf;
+    }
+    if (len && r->atoms.atom_lens)
+        *len = r->atoms.atom_lens[idx];
+    return r->atoms.atoms[idx];
 }
 
 
@@ -195,10 +279,118 @@ static int read_string_value(qjs_reader_t *r, char **out, uint32_t *out_len, uin
 }
 
 /* =========================================================
- * Read a bignum (BC_TAG_BIG_INT / BIG_FLOAT / BIG_DECIMAL)
+ * Big-number mantissa -> decimal string
  *
- * This is a simplified reader that stores the raw sign/exponent
- * and an approximate digit string.
+ * libbf stores a finite number as  value = B * 2^(expn - 8*len),
+ * where B is the little-endian integer formed by the serialised
+ * mantissa bytes.  The limb size of the writer cancels out of that
+ * formula, so the byte stream alone is enough to recover the value.
+ *
+ * The conversion below works on a little-endian base-2^32 limb
+ * array: it first applies the binary shift and then repeatedly
+ * divides by 10 to produce the decimal digits.  No libbf is needed.
+ * ========================================================= */
+static char *bignum_to_decimal(const uint8_t *raw, uint32_t len,
+                               int64_t shift, int neg) {
+    size_t n = (len + 3) / 4;
+    uint32_t *a = xcalloc(n ? n : 1, sizeof(uint32_t));
+    for (uint32_t i = 0; i < len; i++)
+        a[i / 4] |= (uint32_t)raw[i] << ((i % 4) * 8);
+
+    if (shift > 0) {
+        size_t words = (size_t)((uint64_t)shift / 32);
+        int bits = (int)((uint64_t)shift % 32);
+        uint32_t *b = xcalloc(n + words + 1, sizeof(uint32_t));
+        for (size_t i = 0; i < n; i++) {
+            uint64_t v = (uint64_t)a[i] << bits;
+            b[i + words] |= (uint32_t)v;
+            b[i + words + 1] |= (uint32_t)(v >> 32);
+        }
+        free(a);
+        a = b;
+        n = n + words + 1;
+    } else if (shift < 0) {
+        uint64_t s = (uint64_t)(-shift);
+        size_t words = (size_t)(s / 32);
+        int bits = (int)(s % 32);
+        if (words >= n) {
+            free(a);
+            a = NULL;
+            n = 0;
+        } else {
+            size_t nn = n - words;
+            uint32_t *b = xcalloc(nn, sizeof(uint32_t));
+            for (size_t i = 0; i < nn; i++) {
+                uint64_t v = a[i + words];
+                if (bits && i + words + 1 < n)
+                    v |= (uint64_t)a[i + words + 1] << 32;
+                b[i] = (uint32_t)(v >> bits);
+            }
+            free(a);
+            a = b;
+            n = nn;
+        }
+    }
+
+    while (n > 0 && a[n - 1] == 0) n--;
+
+    /* 32 bits hold at most 10 decimal digits. */
+    char *rev = xmalloc(n * 10 + 2);
+    size_t rn = 0;
+    while (n > 0) {
+        uint64_t rem = 0;
+        for (size_t i = n; i-- > 0;) {
+            uint64_t cur = (rem << 32) | a[i];
+            a[i] = (uint32_t)(cur / 10);
+            rem = cur % 10;
+        }
+        rev[rn++] = (char)('0' + rem);
+        while (n > 0 && a[n - 1] == 0) n--;
+    }
+    if (rn == 0) rev[rn++] = '0';
+
+    int is_zero = (rn == 1 && rev[0] == '0');
+    char *out = xmalloc(rn + 2);
+    size_t k = 0;
+    if (neg && !is_zero) out[k++] = '-';
+    for (size_t i = rn; i-- > 0;) out[k++] = rev[i];
+    out[k] = '\0';
+
+    free(rev);
+    free(a);
+    return out;
+}
+
+/* Convert the little-endian packed BCD mantissa of a big decimal into a
+ * plain decimal digit string (most significant digit first). */
+static char *bigdecimal_digits(const uint8_t *raw, uint32_t len) {
+    char *out = xmalloc(len + 2);
+    size_t k = 0;
+    int started = 0;
+    for (uint32_t i = len; i-- > 0;) {
+        int hi = raw[i] >> 4;
+        int lo = raw[i] & 0xf;
+        int d[2];
+        int nd = 0;
+        /* The most significant nibble is a pad zero when len is odd. */
+        if (i != len - 1 || (len & 1) == 0) d[nd++] = hi;
+        d[nd++] = lo;
+        for (int j = 0; j < nd; j++) {
+            if (!started && d[j] == 0) {
+                if (i == 0 && j == nd - 1) out[k++] = '0';
+                continue;
+            }
+            started = 1;
+            out[k++] = (char)('0' + d[j]);
+        }
+    }
+    if (k == 0) out[k++] = '0';
+    out[k] = '\0';
+    return out;
+}
+
+/* =========================================================
+ * Read a bignum (BC_TAG_BIG_INT / BIG_FLOAT / BIG_DECIMAL)
  * ========================================================= */
 static qjs_value_t *read_bignum(qjs_reader_t *r, int kind) {
     int32_t e;
@@ -224,16 +416,26 @@ static qjs_value_t *read_bignum(qjs_reader_t *r, int kind) {
         if (len == 0) {
             v->u.bignum.digits = xstrdup("0");
         } else {
-            /* read raw bytes - for big_int/big_float these are limb bytes;
-             * for big_decimal these are packed BCD digits. We just store
-             * them as hex for display. */
             uint8_t *raw = xmalloc(len);
             if (qjs_get_buf(r, raw, len) < 0) { free(raw); qjs_value_free(v); return NULL; }
-            char *hex = xmalloc(len * 2 + 1);
-            for (uint32_t i = 0; i < len; i++)
-                sprintf(hex + i * 2, "%02x", raw[i]);
+            if (kind == QJS_BC_TAG_BIG_DECIMAL) {
+                char *digits = bigdecimal_digits(raw, len);
+                int64_t shift = v->u.bignum.expn - (int64_t)len;
+                if (shift != 0) {
+                    /* Append the decimal exponent so the value survives. */
+                    size_t dl = strlen(digits);
+                    char *tmp = xmalloc(dl + 32);
+                    snprintf(tmp, dl + 32, "%se%" PRId64, digits, shift);
+                    free(digits);
+                    digits = tmp;
+                }
+                v->u.bignum.digits = digits;
+            } else {
+                int64_t shift = v->u.bignum.expn - (int64_t)len * 8;
+                v->u.bignum.digits = bignum_to_decimal(raw, len, shift,
+                                                       v->u.bignum.sign);
+            }
             free(raw);
-            v->u.bignum.digits = hex;
         }
     } else {
         v->u.bignum.digits = xstrdup(v->u.bignum.expn == 0 ? "0" :
@@ -245,6 +447,52 @@ static qjs_value_t *read_bignum(qjs_reader_t *r, int kind) {
 /* =========================================================
  * Read function bytecode
  * ========================================================= */
+/* =========================================================
+ * Read function
+ * ========================================================= */
+
+/*
+ * Rewrite the atom operands of a byte code body so that they address the
+ * shared atom arena.
+ *
+ * QuickJS stores "first_atom + index_in_the_blob_atom_table" in the byte
+ * code.  When a file holds several blobs (one per module) every blob has
+ * its own atom table, so the index has to be shifted by the offset of the
+ * blob inside the arena.
+ *
+ * Built-in atoms (< first_atom) and tagged integer atoms keep their value.
+ */
+static void patch_bytecode_atoms(qjs_reader_t *r, uint8_t *bc, uint32_t len,
+                                 qjs_op_mode_t mode) {
+    uint32_t base = r->blob_atom_base;
+    uint32_t first = r->atoms.first_atom;
+    if (base == 0) return;
+
+    for (uint32_t pc = 0; pc < len;) {
+        uint8_t op = bc[pc];
+        const qjs_op_info_t *info = qjs_get_op_info(op, mode);
+        if (!info || info->size == 0) break;
+
+        switch (info->fmt) {
+            case QJS_FMT_atom:
+            case QJS_FMT_atom_u8:
+            case QJS_FMT_atom_u16:
+            case QJS_FMT_atom_label_u8:
+            case QJS_FMT_atom_label_u16: {
+                if (pc + 5 > len) return;
+                uint32_t v = rd_u32(bc + pc + 1, r->big_endian);
+                if (!(v & 0x80000000u) && v >= first) {
+                    wr_u32(bc + pc + 1, v + base, r->big_endian);
+                }
+                break;
+            }
+            default:
+                break;
+        }
+        pc += info->size;
+    }
+}
+
 static qjs_function_t *read_function(qjs_reader_t *r) {
     uint16_t v16;
     uint8_t v8;
@@ -322,8 +570,13 @@ static qjs_function_t *read_function(qjs_reader_t *r) {
     fn->byte_code = xmalloc(fn->byte_code_len ? (size_t)fn->byte_code_len : 1);
     if (qjs_get_buf(r, fn->byte_code, fn->byte_code_len) < 0) goto fail;
 
-    /* Auto-detect Frida mode (temporary opcodes preserved in bytecode) */
-    fn->is_frida = detect_frida_mode(fn->byte_code, fn->byte_code_len, r->big_endian);
+    /* Auto-detect the opcode dialect (stock QuickJS vs Frida's fork). */
+    fn->is_frida = (qjs_detect_op_mode(fn->byte_code, fn->byte_code_len,
+                                       r->big_endian) == QJS_MODE_FRIDA);
+
+    /* Shift the atom operands into the shared atom arena. */
+    patch_bytecode_atoms(r, fn->byte_code, (uint32_t)fn->byte_code_len,
+                         fn->is_frida ? QJS_MODE_FRIDA : QJS_MODE_VANILLA);
 
     /* Skip atom resolution pass - atoms are resolved on-the-fly during
      * decompilation via qjs_atom_str(). */
@@ -425,16 +678,18 @@ static qjs_module_t *read_module(qjs_reader_t *r) {
         }
     }
 
-    /* import entries (we skip these for display but must parse them) */
+    /* import entries */
     int import_count = 0;
     if (qjs_get_leb128_int(r, &import_count) < 0) goto fail;
-    for (int i = 0; i < import_count; i++) {
-        int var_idx;
-        uint32_t import_name, req_module_idx;
-        if (qjs_get_leb128_int(r, &var_idx) < 0) goto fail;
-        if (qjs_get_atom(r, &import_name) < 0) goto fail;
-        if (qjs_get_leb128_int(r, &req_module_idx) < 0) goto fail;
-        (void)var_idx; (void)import_name; (void)req_module_idx;
+    if (import_count > 0) {
+        m->imports = xcalloc(import_count, sizeof(qjs_import_entry_t));
+        m->import_count = import_count;
+        for (int i = 0; i < import_count; i++) {
+            qjs_import_entry_t *ie = &m->imports[i];
+            if (qjs_get_leb128_int(r, &ie->var_idx) < 0) goto fail;
+            if (qjs_get_atom(r, &ie->import_name_atom) < 0) goto fail;
+            if (qjs_get_leb128_int(r, &ie->req_module_idx) < 0) goto fail;
+        }
     }
 
     /* has_tla flag */
@@ -507,6 +762,13 @@ static qjs_value_t *read_array(qjs_reader_t *r, int is_template) {
             v->u.arr.items[i] = qjs_read_value(r, 1, 1);
             if (!v->u.arr.items[i]) goto fail;
         }
+    }
+    /* Tagged-template objects serialise an extra value: the "raw" array.
+     * It must be consumed even when we do not use it, otherwise the rest
+     * of the stream is misaligned. */
+    if (is_template) {
+        v->u.arr.raw = qjs_read_value(r, 1, 1);
+        if (!v->u.arr.raw) goto fail;
     }
     if (qjs_add_obj_ref(r, v) < 0) goto fail;
     return v;
@@ -724,38 +986,164 @@ static void set_frida_recursive(qjs_function_t *fn) {
 /* =========================================================
  * Top-level parse
  * ========================================================= */
-qjs_value_t *qjs_parse_bytecode(const uint8_t *buf, size_t len,
-                                 int allow_bytecode, int allow_reference) {
-    qjs_reader_t rs;
-    qjs_reader_init(&rs, buf, len);
 
-    /* For bytecode mode, first_atom = JS_ATOM_END = QJS_BUILTIN_ATOM_COUNT.
+/* Parse the bytecode with a specific atom flavour.
+ *
+ * `strict` enables the atom-table consistency check that tells the vanilla
+ * and Frida flavours apart.  All top-level values of the file are parsed;
+ * a QuickJS byte code file produced by "qjsc -c" contains the main module
+ * followed by all of its dependencies.
+ *
+ * Returns 0 on success and stores the values in *out_values / *out_count. */
+static int parse_with_flavor(qjs_reader_t *rs, const uint8_t *buf,
+                              size_t len, int allow_bytecode,
+                              int allow_reference, int flavor,
+                              int strict, qjs_value_t ***out_values,
+                              int *out_count) {
+    qjs_reader_init(rs, buf, len);
+
+    /* For bytecode mode, first_atom = JS_ATOM_END of the producing runtime.
      * For non-bytecode mode, first_atom = 1 (just JS_ATOM_NULL). */
-    if (allow_bytecode) {
-        rs.atoms.first_atom = QJS_BUILTIN_ATOM_COUNT;
-    } else {
-        rs.atoms.first_atom = 1;
+    rs->atoms.flavor = flavor;
+    rs->atoms.first_atom = allow_bytecode
+        ? ((flavor == QJS_ATOM_FLAVOR_FRIDA) ? QJS_FRIDA_ATOM_END
+                                             : QJS_VANILLA_ATOM_END)
+        : 1;
+
+    /* Read every blob of the file.  A byte code file produced by
+     * "qjsc -c" holds one blob per module: the dependencies first, the
+     * main module last.  Every blob carries its own atom table, so the
+     * blob header (version byte + atom table) is re-read for each of
+     * them. */
+    qjs_value_t **values = NULL;
+    int count = 0, cap = 0;
+    while (rs->ptr < rs->end) {
+        /* A blob header starts with the byte code version byte. */
+        uint8_t peek;
+        if (qjs_reader_peek(rs, &peek) < 0) break;
+        int ver = peek & 0x3f;
+        if (ver != 1 && ver != 2) {
+            /* Not a blob header: trailing garbage, stop here. */
+            break;
+        }
+
+        if (parse_atom_table(rs) < 0) {
+            if (count == 0) {
+                free(values);
+                qjs_reader_cleanup(rs);
+                return -1;
+            }
+            break;
+        }
+
+        uint32_t blob_count = rs->blob_atom_count;
+
+        qjs_value_t *v = qjs_read_value(rs, allow_bytecode, allow_reference);
+        if (!v) {
+            if (count == 0) {
+                free(values);
+                qjs_reader_cleanup(rs);
+                return -1;
+            }
+            break;
+        }
+
+        /* Every atom listed in the blob's atom table was referenced at
+         * least once, so the highest user-atom index must be count - 1.
+         * A mismatch means the flavour guess was wrong. */
+        if (strict && allow_bytecode && blob_count > 0) {
+            int consistent = rs->atoms.saw_user_ref &&
+                             rs->atoms.max_user_ref == blob_count - 1;
+            if (!consistent) {
+                qjs_value_free(v);
+                for (int i = 0; i < count; i++) qjs_value_free(values[i]);
+                free(values);
+                qjs_reader_cleanup(rs);
+                return -1;
+            }
+        }
+
+        if (count >= cap) {
+            cap = cap ? cap * 2 : 4;
+            values = xrealloc(values, (size_t)cap * sizeof(qjs_value_t *));
+        }
+        values[count++] = v;
     }
 
-    if (parse_atom_table(&rs) < 0) {
-        return NULL;
+    if (count == 0) {
+        free(values);
+        qjs_reader_cleanup(rs);
+        return -1;
     }
 
-    qjs_value_t *v = qjs_read_value(&rs, allow_bytecode, allow_reference);
-
-    /* After parsing, propagate is_frida flag through the entire function tree.
-     * If any function uses temporary opcodes, ALL functions should use Frida mode. */
-    if (v && v->kind == QJS_VAL_FUNCTION) {
-        if (check_frida_recursive(v->u.func.fn))
-            set_frida_recursive(v->u.func.fn);
-    } else if (v && v->kind == QJS_VAL_MODULE) {
-        if (v->u.mod.mod->func) {
-            if (check_frida_recursive(v->u.mod.mod->func))
-                set_frida_recursive(v->u.mod.mod->func);
+    /* After parsing, propagate the is_frida flag through the entire
+     * function tree.  If any function uses temporary opcodes, ALL
+     * functions should use Frida mode. */
+    for (int i = 0; i < count; i++) {
+        qjs_value_t *v = values[i];
+        if (v->kind == QJS_VAL_FUNCTION) {
+            if (check_frida_recursive(v->u.func.fn))
+                set_frida_recursive(v->u.func.fn);
+        } else if (v->kind == QJS_VAL_MODULE) {
+            if (v->u.mod.mod->func) {
+                if (check_frida_recursive(v->u.mod.mod->func))
+                    set_frida_recursive(v->u.mod.mod->func);
+            }
         }
     }
 
-    return v;
+    *out_values = values;
+    *out_count = count;
+    return 0;
+}
+
+int qjs_parse_bytecode_list(qjs_reader_t *rs, const uint8_t *buf, size_t len,
+                            int allow_bytecode, int allow_reference,
+                            qjs_value_t ***out_values, int *out_count) {
+    qjs_value_t **values = NULL;
+    int count = 0;
+
+    /* Try vanilla first (by far the most common), then Frida's fork. */
+    if (parse_with_flavor(rs, buf, len, allow_bytecode, allow_reference,
+                          QJS_ATOM_FLAVOR_VANILLA, 1, &values, &count) == 0) {
+        *out_values = values;
+        *out_count = count;
+        return 0;
+    }
+
+    if (parse_with_flavor(rs, buf, len, allow_bytecode, allow_reference,
+                          QJS_ATOM_FLAVOR_FRIDA, 1, &values, &count) == 0) {
+        *out_values = values;
+        *out_count = count;
+        return 0;
+    }
+
+    /* Both flavours failed.  Retry vanilla without the strict consistency
+     * check so the user still gets a (possibly partial) disassembly. */
+    if (parse_with_flavor(rs, buf, len, allow_bytecode, allow_reference,
+                          QJS_ATOM_FLAVOR_VANILLA, 0, &values, &count) == 0) {
+        *out_values = values;
+        *out_count = count;
+        return 0;
+    }
+
+    return -1;
+}
+
+qjs_value_t *qjs_parse_bytecode(qjs_reader_t *rs, const uint8_t *buf, size_t len,
+                                 int allow_bytecode, int allow_reference) {
+    qjs_value_t **values = NULL;
+    int count = 0;
+    if (qjs_parse_bytecode_list(rs, buf, len, allow_bytecode, allow_reference,
+                                &values, &count) < 0)
+        return NULL;
+
+    /* Keep the first value and release the rest; callers that need every
+     * value of the file use qjs_parse_bytecode_list(). */
+    qjs_value_t *first = values[0];
+    for (int i = 1; i < count; i++) qjs_value_free(values[i]);
+    free(values);
+    return first;
 }
 
 /* =========================================================
@@ -782,6 +1170,7 @@ void qjs_module_free(qjs_module_t *m) {
     free(m->exports);
     free(m->star_exports);
     free(m->export_star);
+    free(m->imports);
     qjs_function_free(m->func);
     free(m);
 }
@@ -809,6 +1198,7 @@ void qjs_value_free(qjs_value_t *v) {
                     qjs_value_free(v->u.arr.items[i]);
                 free(v->u.arr.items);
             }
+            qjs_value_free(v->u.arr.raw);
             break;
         case QJS_VAL_BIG_INT:
         case QJS_VAL_BIG_FLOAT:

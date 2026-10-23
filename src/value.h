@@ -23,17 +23,40 @@ const char *qjs_atom_str(qjs_reader_t *r, uint32_t atom_idx);
 /* Like above, but returns a freshly malloc'd buffer (caller frees). */
 char *qjs_atom_dup(qjs_reader_t *r, uint32_t atom_idx);
 
+/* Like qjs_atom_str(), but also yields the atom's exact byte length so
+ * atoms containing NUL bytes survive (see qjs_atom_str_len()). */
+const char *qjs_atom_str_len(qjs_reader_t *r, uint32_t atom_idx, uint32_t *len);
+
 /* =========================================================
  * Top-level parse entry point.
  *
  * Reads the BC_VERSION + atom table, then a single top-level value
  * (which is usually a function or module).
  *
+ * The reader `r` is initialised by this call and keeps the atom table so
+ * that atoms can be resolved afterwards; release it with
+ * qjs_reader_cleanup().
+ *
  * Returns the parsed value (caller frees with qjs_value_free), or
  * NULL on error.
  * ========================================================= */
-qjs_value_t *qjs_parse_bytecode(const uint8_t *buf, size_t len,
+qjs_value_t *qjs_parse_bytecode(qjs_reader_t *r, const uint8_t *buf, size_t len,
                                  int allow_bytecode, int allow_reference);
+
+/* =========================================================
+ * Top-level parse entry point for files that hold several values.
+ *
+ * A byte code file produced by "qjsc -c" contains one blob per module:
+ * every dependency of the main module followed by the main module
+ * itself.  This function parses all of them.
+ *
+ * On success 0 is returned and *out_values / *out_count describe the
+ * array of parsed values (the caller owns them and must release each
+ * one with qjs_value_free() and the array itself with free()).
+ * ========================================================= */
+int qjs_parse_bytecode_list(qjs_reader_t *r, const uint8_t *buf, size_t len,
+                             int allow_bytecode, int allow_reference,
+                             qjs_value_t ***out_values, int *out_count);
 
 /* =========================================================
  * Free a parsed value tree

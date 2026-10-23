@@ -16,10 +16,11 @@
  * Decompile a function into pseudo-JS
  *
  * Outputs to `out`. The cpool_base is the global offset added to
- * cpool indices.
+ * cpool indices.  `module` is non-NULL when the function is the body
+ * of an ES module; it is used to rebuild the import/export statements.
  * ========================================================= */
 void qjs_decompile_function(FILE *out, qjs_reader_t *r, qjs_function_t *fn,
-                             int cpool_base, int indent);
+                             int cpool_base, int indent, qjs_module_t *module);
 
 /* =========================================================
  * Decompile a top-level value
